@@ -7,6 +7,15 @@ pressure builds.
 
 Built with pure Python and `tkinter`. No third-party packages needed.
 
+## Play online
+
+**[Play TypeStorm in your browser](https://subhangam-sharma.github.io/Typestorm/)** - no install needed.
+Works on desktop with a keyboard, and on phones and tablets (tap the screen to
+open the keyboard). A browser version of the game lives in [`index.html`](index.html).
+
+Prefer the desktop version? [Download the ZIP](https://github.com/Subhangam-sharma/Typestorm/archive/refs/heads/main.zip),
+extract it and follow the steps under **Run it** below.
+
 <!-- Add a screenshot or GIF here once you have one:
 ![TypeStorm gameplay](docs/screenshot.png)
 -->
@@ -84,7 +93,8 @@ All tuning values live in [`typestorm/rules.py`](typestorm/rules.py).
 
 ```
 TypeStorm/
-├── main.py              # entry point
+├── index.html           # browser version (HTML + JavaScript, no build step)
+├── main.py              # desktop entry point
 ├── typestorm/
 │   ├── game.py          # game state, input handling, update loop
 │   ├── renderer.py      # all drawing: HUD, word chips, menus, game over screen

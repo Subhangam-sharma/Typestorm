@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>TypeStorm - Typing Arcade Game</title>
+<meta name="description" content="Fast-paced typing arcade game. Type the falling words before they hit the firewall.">
+<style>
+  html, body { margin: 0; height: 100%; background: #05081a; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { width: min(100vw, calc(100vh * 4 / 3)); aspect-ratio: 4 / 3; display: block; touch-action: manipulation; }
+  #kb { position: fixed; left: 0; top: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<input id="kb" type="text" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="typing input">
+<script>
+(() => {
+'use strict';
+
+// ------------------------------------------------------------------ constants
+const W = 800, H = 600, GROUND = 545, FPS = 60;
+const UI = '"Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", sans-serif';
+const MONO = 'Consolas, "SFMono-Regular", Menlo, "Courier New", monospace';
+
+const C = {
+  bgTop: '#070b1f', bgBottom: '#101b42', panel: '#111a3b', panelDark: '#0b1230',
+  edge: '#2b3c80', chip: '#15204a', text: '#eef1ff', muted: '#8190c4', accent: '#4cc9f0',
+  good: '#2ee6a6', warn: '#ffd166', bad: '#ff5d73', orange: '#ff9f68',
+};
+const METEOR_COLORS = [C.accent, C.good, C.warn, '#ff8fd8', '#a29bfe', C.orange];
+const POWER = {
+  freeze: { title: 'FREEZE', desc: 'Slows time for 5 sec', color: C.accent },
+  bomb:   { title: 'BOMB',   desc: 'Clears every meteor',  color: C.orange },
+  life:   { title: '+LIFE',  desc: 'Restores one life',    color: C.good },
+};
+const CHIP_H = 38, CHIP_PAD = 16;
+const FREEZE_FRAMES = 5 * FPS, FREEZE_SLOWDOWN = 0.25;
+
+// ------------------------------------------------------------------ rules
+const rules = {
+  START_LIVES: 5, MAX_LIVES: 7, WORDS_PER_LEVEL: 7,
+  BASE_SPEED: 0.6, SPEED_GROWTH: 1.2, MAX_SPEED: 6.5,
+  BASE_SPAWN: 100, SPAWN_DECAY: 0.88, MIN_SPAWN: 20,
+  DIFFICULTY: { Easy: 0.8, Normal: 1.0, Hard: 1.25 },
+  levelFor: (killed) => 1 + Math.floor(killed / 7),
+  fallSpeed(level, factor = 1) {
+    return Math.min(this.MAX_SPEED, this.BASE_SPEED * Math.pow(this.SPEED_GROWTH, level - 1)) * factor;
+  },
+  spawnInterval(level, factor = 1) {
+    return Math.max(this.MIN_SPAWN, Math.floor(this.BASE_SPAWN * Math.pow(this.SPAWN_DECAY, level - 1) / factor));
+  },
+  comboMultiplier: (combo) => 1 + Math.floor(combo / 5) * 0.5,
+  scoreForWord(len, combo, boss) {
+    const pts = Math.floor(len * 10 * this.comboMultiplier(combo));
+    return boss ? pts * 3 : pts;
+  },
+  accuracy: (hit, total) => total > 0 ? 100 * hit / total : 100,
+  wpm: (chars, frames) => frames > 0 ? (chars / 5) / (frames / (FPS * 60)) : 0,
+};
+
+// ------------------------------------------------------------------ words
+const WORDS = [...new Set(`
+art bit bug cpu css dns git gui ram sql tab web zip
+app bash byte cache chip code data disk edit file font grid hash host icon
+java link list loop mail menu node path port root sort tree user wifi
+array audio batch bytes cloud debug email event fetch frame input logic
+macro merge mouse parse patch pixel proxy query queue regex route scope
+shell stack style token trace tuple video
+binary branch buffer bundle cursor deploy domain driver engine format
+header kernel layout module object packet python script server socket
+syntax thread vector window
+backend browser compile console desktop execute gateway library network
+package pointer program runtime session storage variable
+boolean compiler database frontend function hardware keyboard platform
+protocol resilient software terminal ephemeral pragmatic versatile
+algorithm developer interface processor recursion framework generation
+diligent eloquent tenacious meticulous ambiguous benevolent
+`.split(/\s+/).filter(Boolean))].sort();
+const BOSS_WORDS = ['authentication', 'synchronization', 'internationalize', 'multiprocessing',
+  'cybersecurity', 'objectoriented', 'virtualization', 'microprocessor', 'troubleshooting'];
+
+const maxLength = (level) => Math.min(12, 3 + level);
+function pickWord(level, avoid) {
+  const limit = maxLength(level);
+  let pool = WORDS.filter((w) => w.length <= limit);
+  const fresh = pool.filter((w) => !avoid.has(w[0]));
+  if (fresh.length) pool = fresh;
+  const weights = pool.map((w) => Math.pow(w.length, 1.5));
+  let r = Math.random() * weights.reduce((a, b) => a + b, 0);
+  for (let i = 0; i < pool.length; i++) { r -= weights[i]; if (r <= 0) return pool[i]; }
+  return pool[pool.length - 1];
+}
+
+// ------------------------------------------------------------------ helpers
+const rand = (a, b) => a + Math.random() * (b - a);
+const randInt = (a, b) => Math.floor(rand(a, b + 1));
+const rgb = (c) => [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16));
+function mix(a, b, t) {
+  t = Math.max(0, Math.min(1, t));
+  const A = rgb(a), B = rgb(b);
+  return '#' + A.map((v, i) => Math.round(v + (B[i] - v) * t).toString(16).padStart(2, '0')).join('');
+}
+
+// ------------------------------------------------------------------ storage
+const STORE_KEY = 'typestorm_stats_v1';
+function loadStats() {
+  const s = { best: { Easy: 0, Normal: 0, Hard: 0 }, games: 0, words: 0 };
+  try {
+    const d = JSON.parse(localStorage.getItem(STORE_KEY));
+    if (d && typeof d === 'object') {
+      for (const k of Object.keys(s.best)) if (Number.isInteger(d.best && d.best[k])) s.best[k] = d.best[k];
+      if (Number.isInteger(d.games)) s.games = d.games;
+      if (Number.isInteger(d.words)) s.words = d.words;
+    }
+  } catch (e) { /* ignore corrupt or unavailable storage */ }
+  return s;
+}
+function saveStats(s) { try { localStorage.setItem(STORE_KEY, JSON.stringify(s)); } catch (e) { /* ignore */ } }
+
+// ------------------------------------------------------------------ sound
+const PATTERNS = {
+  hit: [[880, 40]], wrong: [[180, 60]], miss: [[220, 90], [150, 140]],
+  power: [[660, 60], [880, 60], [1170, 90]], level: [[523, 80], [659, 80], [784, 80], [1047, 160]],
+  over: [[392, 150], [330, 150], [262, 300]],
+};
+let audio = null, soundOn = true;
+function beep(name) {
+  if (!soundOn) return;
+  try {
+    if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+    if (audio.state === 'suspended') audio.resume();
+    let t = audio.currentTime;
+    for (const [freq, ms] of PATTERNS[name]) {
+      const osc = audio.createOscillator(), gain = audio.createGain();
+      osc.type = 'square'; osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.035, t);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + ms / 1000);
+      osc.connect(gain); gain.connect(audio.destination);
+      osc.start(t); osc.stop(t + ms / 1000);
+      t += ms / 1000;
+    }
+  } catch (e) { /* audio is optional */ }
+}
+
+// ------------------------------------------------------------------ canvas setup
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const dpr = Math.min(window.devicePixelRatio || 1, 2);
+canvas.width = W * dpr; canvas.height = H * dpr;
+
+const bg = document.createElement('canvas');
+bg.width = W * dpr; bg.height = H * dpr;
+(function paintBackground() {
+  const b = bg.getContext('2d');
+  b.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const grad = b.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, C.bgTop); grad.addColorStop(1, C.bgBottom);
+  b.fillStyle = grad; b.fillRect(0, 0, W, H);
+  b.strokeStyle = mix(C.bgBottom, C.accent, 0.07); b.lineWidth = 1;
+  b.beginPath();
+  for (let x = 0; x <= W; x += 50) { b.moveTo(x + 0.5, 0); b.lineTo(x + 0.5, GROUND); }
+  for (let y = 40; y < GROUND; y += 50) { b.moveTo(0, y + 0.5); b.lineTo(W, y + 0.5); }
+  b.stroke();
+})();
+
+// ------------------------------------------------------------------ game state
+const touchMode = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+const kb = document.getElementById('kb');
+const DIFFS = Object.keys(rules.DIFFICULTY);
+const stats = loadStats();
+const g = {
+  state: 'menu', ticks: 0, diffIndex: 1,
+  stars: Array.from({ length: 90 }, () => [randInt(0, W), rand(0, GROUND), [0.4, 0.8, 1.4][randInt(0, 2)]]),
+};
+
+const difficulty = () => DIFFS[g.diffIndex];
+const factor = () => rules.DIFFICULTY[difficulty()];
+const level = () => rules.levelFor(g.killed);
+
+function reset() {
+  Object.assign(g, {
+    score: 0, lives: rules.START_LIVES, killed: 0, combo: 0, bestCombo: 0,
+    meteors: [], particles: [], floaters: [], target: null, progress: 0, timer: 0,
+    flash: 0, shake: 0, banner: 0, freeze: 0, framesPlayed: 0, keysTotal: 0, keysHit: 0,
+    charsOk: 0, bossLevels: new Set(), shownLevel: 1, newBest: false,
+  });
+}
+reset();
+
+function start() {
+  reset();
+  g.state = 'play';
+  g.timer = rules.spawnInterval(1, factor());
+  if (touchMode) kb.focus();
+}
+
+// ------------------------------------------------------------------ text measuring
+function setFont(size, bold, mono) { ctx.font = `${bold ? '700' : '400'} ${size}px ${mono ? MONO : UI}`; }
+function chipWidth(word) { setFont(18, true, true); return ctx.measureText(word).width + CHIP_PAD * 2; }
+
+// ------------------------------------------------------------------ logic
+function spawn() {
+  const lvl = level();
+  const initials = new Set(g.meteors.map((m) => m.text[0]));
+  let kind = 'normal';
+  if (lvl >= 2 && Math.random() < 0.10 && g.meteors.every((m) => !POWER[m.kind])) {
+    kind = Object.keys(POWER)[randInt(0, 2)];
+  }
+  const text = pickWord(POWER[kind] ? Math.min(lvl, 3) : lvl, initials);
+  const color = POWER[kind] ? POWER[kind].color : METEOR_COLORS[randInt(0, METEOR_COLORS.length - 1)];
+  const speed = rules.fallSpeed(lvl, factor()) * rand(0.9, 1.15);
+  const sway = lvl >= 5 && kind === 'normal' ? Math.min(30, (lvl - 4) * 6) : 0;
+  const margin = Math.ceil(chipWidth(text) / 2 + sway + 14);
+  const x = randInt(margin, W - margin);
+  g.meteors.push({ text, x, y: -40, speed, color, kind, baseX: x, sway, phase: rand(0, Math.PI * 2) });
+}
+
+function spawnBoss() {
+  g.bossLevels.add(level());
+  const text = BOSS_WORDS[randInt(0, BOSS_WORDS.length - 1)];
+  g.meteors.push({ text, x: W / 2, y: -50, speed: rules.fallSpeed(level(), factor()) * 0.45,
+    color: C.warn, kind: 'boss', baseX: W / 2, sway: 0, phase: 0 });
+}
+
+function explode(x, y, color, count = 22) {
+  for (let i = 0; i < count; i++) {
+    const a = rand(0, Math.PI * 2), p = rand(1, 5);
+    g.particles.push({ x, y, vx: Math.cos(a) * p, vy: Math.sin(a) * p, life: 30, color });
+  }
+}
+
+function removeMeteor(m) { g.meteors.splice(g.meteors.indexOf(m), 1); }
+
+function destroy(m) {
+  const points = rules.scoreForWord(m.text.length, g.combo, m.kind === 'boss');
+  g.score += points; g.combo++; g.bestCombo = Math.max(g.bestCombo, g.combo);
+  g.killed++; g.charsOk += m.text.length;
+  removeMeteor(m); g.target = null; g.progress = 0;
+  explode(m.x, m.y, m.color, m.kind === 'boss' ? 40 : 22);
+  g.floaters.push({ text: '+' + points, x: m.x, y: m.y - 24, life: 45 });
+  beep(POWER[m.kind] ? 'power' : 'hit');
+
+  if (m.kind === 'freeze') g.freeze = FREEZE_FRAMES;
+  else if (m.kind === 'life') g.lives = Math.min(rules.MAX_LIVES, g.lives + 1);
+  else if (m.kind === 'bomb') {
+    for (const other of g.meteors.slice()) {
+      if (other.kind !== 'boss') { explode(other.x, other.y, other.color); g.score += other.text.length * 5; removeMeteor(other); }
+    }
+    g.target = null; g.progress = 0;
+  }
+  if (level() > g.shownLevel) {
+    g.shownLevel = level(); g.banner = 110; beep('level');
+    if (level() % 4 === 0 && !g.bossLevels.has(level())) spawnBoss();
+  }
+}
+
+function loseLife(m) {
+  g.lives -= m.kind === 'boss' ? 2 : 1;
+  g.combo = 0; g.flash = 14; g.shake = 16;
+  explode(m.x, GROUND, C.bad, 30);
+  beep('miss');
+  if (g.lives <= 0) gameOver();
+}
+
+function gameOver() {
+  g.state = 'over';
+  stats.games++; stats.words += g.killed;
+  g.newBest = g.score > stats.best[difficulty()];
+  if (g.newBest) stats.best[difficulty()] = g.score;
+  saveStats(stats);
+  beep('over');
+  if (touchMode) kb.blur();
+}
+
+function typeChar(ch) {
+  ch = ch.toLowerCase();
+  if (!/^[a-z]$/.test(ch)) return;
+  g.keysTotal++;
+  if (!g.target) {
+    const options = g.meteors.filter((m) => m.text[0] === ch);
+    if (!options.length) { g.combo = 0; beep('wrong'); return; }
+    g.target = options.reduce((a, b) => (b.y > a.y ? b : a));
+    g.progress = 1; g.keysHit++;
+  } else if (ch === g.target.text[g.progress]) {
+    g.progress++; g.keysHit++;
+  } else { g.combo = 0; beep('wrong'); return; }
+  if (g.progress === g.target.text.length) destroy(g.target);
+}
+
+function handleKey(key) {
+  if (key === 'F1') { soundOn = !soundOn; return; }
+  if (g.state === 'menu' || g.state === 'over') {
+    if (key === 'Enter') start();
+    else if (key === 'ArrowLeft') g.diffIndex = (g.diffIndex + DIFFS.length - 1) % DIFFS.length;
+    else if (key === 'ArrowRight') g.diffIndex = (g.diffIndex + 1) % DIFFS.length;
+    return;
+  }
+  if (key === 'Tab') { g.state = g.state === 'play' ? 'paused' : 'play'; return; }
+  if (g.state === 'paused') return;
+  if (key === 'Escape') { g.target = null; g.progress = 0; return; }
+  if (!touchMode && key.length === 1) typeChar(key);
+}
+
+function update() {
+  g.ticks++;
+  const speedUp = 1 + level() * 0.06;
+  for (const s of g.stars) {
+    s[1] += s[2] * speedUp;
+    if (s[1] > GROUND) { s[0] = randInt(0, W); s[1] = 0; }
+  }
+  for (const p of g.particles) { p.x += p.vx; p.y += p.vy; p.vy += 0.12; p.life--; }
+  g.particles = g.particles.filter((p) => p.life > 0);
+  for (const f of g.floaters) { f.y -= 1; f.life--; }
+  g.floaters = g.floaters.filter((f) => f.life > 0);
+  g.flash = Math.max(0, g.flash - 1); g.shake = Math.max(0, g.shake - 1); g.banner = Math.max(0, g.banner - 1);
+  if (g.state !== 'play') return;
+
+  g.framesPlayed++;
+  const slow = g.freeze ? FREEZE_SLOWDOWN : 1;
+  g.freeze = Math.max(0, g.freeze - 1);
+  g.timer += slow;
+  if (g.timer >= rules.spawnInterval(level(), factor())) { g.timer = 0; spawn(); }
+
+  for (const m of g.meteors.slice()) {
+    m.y += m.speed * slow;
+    if (m.sway) { m.phase += 0.04 * slow; m.x = m.baseX + Math.sin(m.phase) * m.sway; }
+    if (m.y + CHIP_H / 2 >= GROUND) {
+      removeMeteor(m);
+      if (m === g.target) { g.target = null; g.progress = 0; }
+      loseLife(m);
+      if (g.state === 'over') return;
+    }
+  }
+}
+
+// ------------------------------------------------------------------ drawing helpers
+function rr(x1, y1, x2, y2, r) {
+  r = Math.min(r, (x2 - x1) / 2, (y2 - y1) / 2);
+  ctx.beginPath();
+  ctx.moveTo(x1 + r, y1);
+  ctx.arcTo(x2, y1, x2, y2, r); ctx.arcTo(x2, y2, x1, y2, r);
+  ctx.arcTo(x1, y2, x1, y1, r); ctx.arcTo(x1, y1, x2, y1, r);
+  ctx.closePath();
+}
+function box(x1, y1, x2, y2, r, fill, stroke, lw = 1) {
+  rr(x1, y1, x2, y2, r);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke(); }
+}
+function text(x, y, s, size, color, bold = false, align = 'center', maxW = 0, mono = false) {
+  setFont(size, bold, mono);
+  while (maxW && size > 9 && ctx.measureText(s).width > maxW) { size--; setFont(size, bold, mono); }
+  ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = 'middle';
+  ctx.fillText(s, x, y);
+}
+function pill(x, y, label, color, size = 12, align = 'center', filled = false) {
+  setFont(size, true, false);
+  const w = ctx.measureText(label).width + 20, h = size + 12;
+  const x1 = align === 'center' ? x - w / 2 : align === 'left' ? x : x - w;
+  box(x1, y - h / 2, x1 + w, y + h / 2, h / 2, filled ? color : mix(C.panelDark, color, 0.18), color);
+  text(x1 + w / 2, y, label, size, filled ? C.panelDark : color, true);
+}
+function heart(cx, cy, size, fill, stroke) {
+  ctx.beginPath();
+  for (let i = 0; i <= 28; i++) {
+    const t = i / 28 * Math.PI * 2;
+    const x = 16 * Math.pow(Math.sin(t), 3);
+    const y = -(13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t));
+    const px = cx + x * size / 16, py = cy + y * size / 16 + size * 0.1;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.stroke(); }
+}
+
+// ------------------------------------------------------------------ drawing
+function drawGround() {
+  const col = g.flash ? C.bad : C.good;
+  ctx.fillStyle = '#0a1230'; ctx.fillRect(0, GROUND, W, H - GROUND);
+  ctx.fillStyle = mix(C.bgBottom, col, 0.18); ctx.fillRect(0, GROUND - 8, W, 8);
+  ctx.fillStyle = col; ctx.fillRect(0, GROUND - 1.5, W, 3);
+  ctx.fillStyle = mix('#0a1230', col, 0.45);
+  for (let x = -36 + (g.ticks * 0.6) % 36; x < W; x += 36) ctx.fillRect(x, GROUND + 7, 18, 3);
+  text(18, GROUND + 30, 'FIREWALL', 12, col, true, 'left');
+  text(W / 2, H - 20, touchMode ? 'Tap the screen to open the keyboard'
+    : 'TAB  pause      ESC  drop target      F1  sound', 12, C.muted);
+  if (!soundOn) text(W - 18, GROUND + 30, 'SOUND OFF', 12, C.muted, true, 'right');
+}
+
+function drawMeteor(m) {
+  const width = chipWidth(m.text);
+  const x1 = m.x - width / 2, x2 = m.x + width / 2, y1 = m.y - CHIP_H / 2, y2 = m.y + CHIP_H / 2;
+  const isTarget = m === g.target, boss = m.kind === 'boss';
+  const edge = g.freeze ? mix(m.color, C.accent, 0.5) : m.color;
+
+  for (let i = 1; i <= 5; i++) {
+    ctx.strokeStyle = mix(C.bgTop, edge, 0.75 - i * 0.13);
+    ctx.lineWidth = Math.max(1, 4 - Math.floor(i / 2));
+    ctx.beginPath(); ctx.moveTo(m.x, y1 - i * 9 - 5); ctx.lineTo(m.x, y1 - i * 9); ctx.stroke();
+  }
+  if (isTarget) box(x1 - 5, y1 - 5, x2 + 5, y2 + 5, CHIP_H / 2 + 5, null, mix(C.bgTop, C.accent, 0.55), 3);
+  box(x1, y1, x2, y2, CHIP_H / 2, C.chip, isTarget ? '#ffffff' : (boss ? C.warn : edge), isTarget || boss ? 3 : 2);
+
+  setFont(18, true, true);
+  const done = isTarget ? m.text.slice(0, g.progress) : '';
+  const left = m.x - ctx.measureText(m.text).width / 2;
+  const doneW = ctx.measureText(done).width;
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = C.good; ctx.fillText(done, left, m.y + 1);
+  ctx.fillStyle = C.text; ctx.fillText(m.text.slice(done.length), left + doneW, m.y + 1);
+
+  if (boss) pill(m.x, y1 - 18, 'BOSS  x3 points', C.warn, 11, 'center', true);
+  else if (POWER[m.kind]) pill(m.x, y1 - 18, POWER[m.kind].title, POWER[m.kind].color, 11, 'center', true);
+}
+
+function drawHud() {
+  box(12, 10, W - 12, 64, 14, C.panel, C.edge);
+  text(30, 24, 'SCORE', 11, C.muted, true, 'left');
+  text(30, 46, g.score.toLocaleString('en-US'), 26, C.text, true, 'left');
+  text(W / 2, 24, 'LEVEL ' + level(), 17, C.warn, true);
+  const filled = (g.killed % rules.WORDS_PER_LEVEL) / rules.WORDS_PER_LEVEL;
+  box(W / 2 - 80, 42, W / 2 + 80, 50, 4, C.panelDark, C.edge);
+  if (filled > 0) box(W / 2 - 80, 42, W / 2 - 80 + Math.max(8, 160 * filled), 50, 4, C.warn);
+  const slots = Math.max(rules.START_LIVES, g.lives);
+  for (let i = 0; i < slots; i++) {
+    const x = W - 38 - (slots - 1 - i) * 26;
+    if (i < g.lives) heart(x, 38, 10, C.bad); else heart(x, 38, 10, null, mix(C.bad, C.panel, 0.6));
+  }
+  if (g.state === 'play' && g.combo >= 3) {
+    pill(14, 82, `COMBO x${g.combo}  -  score x${rules.comboMultiplier(g.combo)}`, C.accent, 12, 'left');
+  }
+  if (g.freeze) pill(W - 14, 82, `FROZEN ${(g.freeze / FPS).toFixed(1)}s`, C.accent, 12, 'right', true);
+}
+
+function drawPanel(x1, y1, x2, y2) {
+  box(x1 + 4, y1 + 6, x2 + 4, y2 + 6, 22, '#02030c');
+  box(x1, y1, x2, y2, 22, C.panel, C.edge, 2);
+}
+
+function startButton(y1, y2, label, size) {
+  const pulse = (Math.sin(g.ticks * 0.08) + 1) / 2;
+  box(W / 2 - 140, y1, W / 2 + 140, y2, (y2 - y1) / 2, mix(C.good, '#7dffd2', pulse * 0.5));
+  text(W / 2, (y1 + y2) / 2, label, size, C.panelDark, true);
+}
+
+function drawMenu() {
+  drawPanel(110, 55, W - 110, 565);
+  text(W / 2 + 3, 121, 'TYPESTORM', 56, mix(C.panel, C.accent, 0.35), true, 'center', 480);
+  text(W / 2, 118, 'TYPESTORM', 56, C.accent, true, 'center', 480);
+  text(W / 2, 166, 'Type the falling words before they hit the firewall', 14, C.muted, false, 'center', 500);
+
+  const x0 = W / 2 - 180, y1 = 200, y2 = 242, cell = 120;
+  box(x0, y1, x0 + cell * 3, y2, 21, C.panelDark, C.edge);
+  DIFFS.forEach((name, i) => {
+    const sel = i === g.diffIndex;
+    if (sel) box(x0 + i * cell + 4, y1 + 4, x0 + (i + 1) * cell - 4, y2 - 4, 17, C.accent);
+    text(x0 + i * cell + cell / 2, (y1 + y2) / 2, name, 15, sel ? C.panelDark : C.muted, true);
+  });
+  text(W / 2, 262, `${touchMode ? 'Tap' : 'Left / Right to change'}   -   Best score: ${stats.best[difficulty()].toLocaleString('en-US')}`,
+    12, C.muted, false, 'center', 480);
+
+  text(W / 2, 298, 'POWER WORDS', 11, C.muted, true);
+  const cw = 150, gap = 12, cx = W / 2 - (cw * 3 + gap * 2) / 2;
+  ['freeze', 'bomb', 'life'].forEach((kind, i) => {
+    const p = POWER[kind], x = cx + i * (cw + gap);
+    box(x, 312, x + cw, 380, 14, C.panelDark, mix(C.panelDark, p.color, 0.55));
+    text(x + cw / 2, 336, p.title, 16, p.color, true);
+    text(x + cw / 2, 360, p.desc, 12, C.muted, false, 'center', cw - 16);
+  });
+  text(W / 2, 408, 'Every 4th level a BOSS word drops: triple points, but it costs 2 lives.', 12, C.warn, false, 'center', 480);
+  startButton(440, 490, touchMode ? 'TAP  TO  START' : 'PRESS  ENTER  TO  START', 16);
+  text(W / 2, 524, 'Wrong keys break your combo  -  every 5 words in a row add +0.5x', 12, C.muted, false, 'center', 480);
+}
+
+function drawGameOver() {
+  drawPanel(120, 60, W - 120, 560);
+  text(W / 2, 112, 'SYSTEM BREACHED', 38, C.bad, true, 'center', 520);
+  text(W / 2, 190, g.score.toLocaleString('en-US'), 64, C.text, true, 'center', 400);
+  text(W / 2, 238, 'FINAL SCORE', 12, C.muted, true);
+  if (g.newBest) pill(W / 2, 272, 'NEW PERSONAL BEST', C.warn, 13, 'center', true);
+  else text(W / 2, 272, `Best on ${difficulty()}: ${stats.best[difficulty()].toLocaleString('en-US')}`, 13, C.muted);
+
+  const acc = rules.accuracy(g.keysHit, g.keysTotal), speed = rules.wpm(g.charsOk, g.framesPlayed);
+  const cards = [['LEVEL', level()], ['WORDS', g.killed], ['BEST COMBO', 'x' + g.bestCombo],
+    ['ACCURACY', Math.round(acc) + '%'], ['SPEED', Math.round(speed) + ' WPM'], ['MODE', difficulty()]];
+  const cw = 150, ch = 70, gap = 14, x0 = W / 2 - (cw * 3 + gap * 2) / 2;
+  cards.forEach(([label, value], i) => {
+    const x = x0 + (i % 3) * (cw + gap), y = 312 + Math.floor(i / 3) * (ch + gap);
+    box(x, y, x + cw, y + ch, 14, C.panelDark, C.edge);
+    text(x + cw / 2, y + 25, String(value), 22, C.text, true, 'center', cw - 16);
+    text(x + cw / 2, y + 52, label, 11, C.muted, true);
+  });
+  startButton(482, 526, touchMode ? 'TAP  TO  PLAY  AGAIN' : 'ENTER  TO  PLAY  AGAIN', 15);
+  text(W / 2, 546, touchMode ? 'Tap a mode on the menu to change difficulty' : 'Left / Right to change difficulty', 11, C.muted);
+}
+
+function draw() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.drawImage(bg, 0, 0, W, H);
+  ctx.save();
+  if (g.shake) ctx.translate(randInt(-g.shake, g.shake) / 2, randInt(-g.shake, g.shake) / 2);
+
+  for (const [x, y, speed] of g.stars) {
+    ctx.fillStyle = mix(C.bgBottom, '#ffffff', 0.25 + speed * 0.35);
+    ctx.fillRect(x, y, speed * 1.8, speed * 1.8);
+  }
+  drawGround();
+  g.meteors.forEach(drawMeteor);
+  for (const p of g.particles) {
+    const r = Math.max(1, p.life / 9);
+    ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
+  }
+  for (const f of g.floaters) text(f.x, f.y, f.text, 16, mix(C.bgTop, '#ffffff', Math.min(1, f.life / 20)), true);
+  if (g.freeze) box(3, 3, W - 3, H - 3, 0, null, mix(C.bgTop, C.accent, 0.8), 3);
+  if (g.state !== 'menu') drawHud();
+  if (g.state === 'play' && g.banner) {
+    const fade = Math.min(1, g.banner / 30);
+    text(W / 2 + 2, 252, 'LEVEL ' + level(), 54, mix(C.bgBottom, '#000000', fade * 0.5), true);
+    text(W / 2, 250, 'LEVEL ' + level(), 54, mix(C.bgBottom, C.warn, fade), true);
+    text(W / 2, 292, 'THE STORM SPEEDS UP', 14, mix(C.bgBottom, C.text, fade), true);
+  }
+  if (g.state !== 'play') { ctx.fillStyle = 'rgba(2, 3, 12, 0.62)'; ctx.fillRect(0, 0, W, H); }
+  if (g.state === 'menu') drawMenu();
+  else if (g.state === 'paused') {
+    drawPanel(240, 230, W - 240, 370);
+    text(W / 2, 280, 'PAUSED', 40, C.accent, true);
+    text(W / 2, 335, touchMode ? 'Tap to continue' : 'Press TAB to continue', 14, C.muted);
+  } else if (g.state === 'over') drawGameOver();
+  ctx.restore();
+}
+
+// ------------------------------------------------------------------ input wiring
+window.addEventListener('keydown', (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (['Tab', 'F1', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', ' '].includes(e.key)) e.preventDefault();
+  handleKey(e.key);
+});
+
+kb.addEventListener('input', () => {
+  const v = kb.value; kb.value = '';
+  if (g.state === 'play') for (const ch of v) typeChar(ch);
+});
+
+canvas.addEventListener('pointerdown', (e) => {
+  if (audio && audio.state === 'suspended') audio.resume();
+  const r = canvas.getBoundingClientRect();
+  const x = (e.clientX - r.left) / r.width * W, y = (e.clientY - r.top) / r.height * H;
+  if (g.state === 'menu' && y >= 200 && y <= 242 && x >= W / 2 - 180 && x <= W / 2 + 180) {
+    g.diffIndex = Math.min(2, Math.floor((x - (W / 2 - 180)) / 120));
+  } else if (g.state === 'menu' || g.state === 'over') start();
+  else if (g.state === 'paused') g.state = 'play';
+  if (touchMode && g.state === 'play') kb.focus();
+});
+
+window.addEventListener('blur', () => { if (g.state === 'play') g.state = 'paused'; });
+
+// ------------------------------------------------------------------ main loop (fixed 60 updates per second)
+let last = performance.now(), acc = 0;
+const STEP = 1000 / FPS;
+function frame(now) {
+  acc += Math.min(100, now - last); last = now;
+  while (acc >= STEP) { update(); acc -= STEP; }
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+window.__typestorm = { g, update, draw, handleKey, typeChar, rules, start, stats };
+})();
+</script>
+</body>
+</html>
